@@ -1,0 +1,23 @@
+# Postgres só deste projeto, na porta 5433 do host.
+# O .env aponta DATABASE_URL para 127.0.0.1:5433.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: graceful-api-postgres
+    environment:
+      POSTGRES_USER: graceful
+      POSTGRES_PASSWORD: graceful
+      POSTGRES_DB: graceful
+    ports:
+      - "5433:5432"
+    volumes:
+      # Dados sobrevivem a docker compose down, sem -v.
+      - graceful_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graceful -d graceful"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  graceful_pg:
