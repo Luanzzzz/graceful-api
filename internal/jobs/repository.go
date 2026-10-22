@@ -238,3 +238,34 @@ func scanJob(rows pgx.Rows) (*Job, error) {
 	job.Status = Status(status)
 	return &job, nil
 }
+
+// RenewLease renova o lease do job.
+// Se o job não estiver processing, retorna ErrLeaseLost.
+// Se o job não tiver lease_until, retorna ErrLeaseLost.
+// Se o job não tiver attempts, retorna ErrLeaseLost.
+// Se o job não tiver lease_until > NOW(), retorna ErrLeaseLost.
+// Se o job não tiver attempts = $2, retorna ErrLeaseLost.
+// Se o job não tiver lease_until > NOW(), retorna ErrLeaseLost.
+func (r *Repository) RenewLease(ctx context.Context, jobID int64, attempt int) error {
+	const sql = `
+		UPDATE jobs
+		SET
+			lease_until = NOW() + interval '30 seconds',
+			updated_at = NOW()
+		WHERE id = $1
+			AND status = 'processing'
+			AND attempts = $2
+			AND lease_until > NOW()
+	`
+
+	tag, err := r.pool.Exec(ctx, sql, jobID, attempt)
+	if err != nil {
+		return fmt.Errorf("renovar lease: %w", err)
+	}
+
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("job %d: %w", jobID, ErrLeaseLost)
+	}
+
+	return nil
+}
