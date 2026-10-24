@@ -215,3 +215,145 @@ func TestRenewLeaseSuccess(t *testing.T) {
 		t.Fatalf("lease_until não aumentou: original=%v atual=%v", originalLease, leaseUntil)
 	}
 }
+
+// testar se uma tentativa obsoleta não consegue renovar o lease
+// Criar um job com status processing, attempts = 3 e lease válido.
+// Chamar RenewLease() informando attempt = 2.
+// Verificar que o erro retornado corresponde a ErrLeaseLost, preferencialmente usando errors.Is().
+// Consultar o banco e verificar que lease_until não foi alterado.
+func TestRenewLeaseStaleAttempt(t *testing.T) {
+	repo, pool := setupTestRepository(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var id int64
+	var originalLease time.Time
+	err := pool.QueryRow(ctx, `
+		INSERT INTO jobs (
+		    payload,
+		    status,
+		    attempts,
+		    lease_until
+		)
+		VALUES (
+		    '{"document_id": 999}',
+		    'processing',
+		    3,
+		    NOW() + INTERVAL '5 seconds'
+		)
+		RETURNING id, lease_until
+	`).Scan(&id, &originalLease)
+	if err != nil {
+		t.Fatalf("criar job processing: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM jobs WHERE id = $1", id); err != nil {
+			t.Errorf("remover job de teste %d: %v", id, err)
+		}
+	})
+
+	// Renovar o lease do job.
+	err = repo.RenewLease(ctx, id, 2)
+
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("tentativa obsoleta: esperado ErrLeaseLost; recebido %v", err)
+	}
+
+	// Verificar se o job ainda está na tentativa 3.
+	var status string
+	var attempts int
+	if err := pool.QueryRow(ctx, "SELECT status, attempts FROM jobs WHERE id = $1", id).Scan(&status, &attempts); err != nil {
+		t.Fatalf("consultar job: %v", err)
+	}
+	if status != "processing" || attempts != 3 {
+		t.Fatalf("job não está na tentativa 3: status=%q attempts=%d", status, attempts)
+	}
+
+	// Verificar se o lease não foi alterado.
+	var leaseUntil time.Time
+	if err := pool.QueryRow(ctx, "SELECT lease_until FROM jobs WHERE id = $1", id).Scan(&leaseUntil); err != nil {
+		t.Fatalf("consultar lease_until: %v", err)
+	}
+	if !leaseUntil.Equal(originalLease) {
+		t.Fatalf(
+			"lease_until foi alterado: original=%v atual=%v",
+			originalLease,
+			leaseUntil,
+		)
+	}
+}
+
+// testar se um um woekwe consegue renovare um lease que já expirou
+// status = processing, attempts = 2, lease_until = 30s no passado, tentativa enviada = 2
+// erro esperado = ErrLeaseLost
+// usa o proprio relogio do PostgreSQL
+// Criterios de sucesso:
+// - RenewLease() retorna ErrLeaseLost
+// - lease_until não foi alterado
+// - o status deve continuar processing e attempts deve continar 2
+func TestRenewLeaseExpired(t *testing.T) {
+	repo, pool := setupTestRepository(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Criar um job com status processing, attempts = 2 e lease_until = 30s no passado.
+	// Retornar o id e o lease_until.
+	var id int64
+	var originalLease time.Time
+	err := pool.QueryRow(ctx, `
+		INSERT INTO jobs (
+		    payload,
+		    status,
+		    attempts,
+			lease_until
+		)
+		VALUES (
+		    '{"document_id": 999}',
+		    'processing',
+		    2,
+		    NOW() - INTERVAL '30 seconds'
+		)
+		RETURNING id, lease_until
+	`).Scan(&id, &originalLease)
+
+	// Verificar se o job foi criado com sucesso.
+	if err != nil {
+		t.Fatalf("criar job processing: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM jobs WHERE id = $1", id); err != nil {
+			t.Errorf("remover job de teste %d: %v", id, err)
+		}
+	})
+	// Renovar o lease do job
+	err = repo.RenewLease(ctx, id, 2)
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("tentativa expirada: esperado ErrLeaseLost; recebido %v", err)
+	}
+
+	// Verificar se o lease não foi alterado.
+	var leaseUntil time.Time
+	if err := pool.QueryRow(ctx, "SELECT lease_until FROM jobs WHERE id = $1", id).Scan(&leaseUntil); err != nil {
+		t.Fatalf("consultar lease_until: %v", err)
+	}
+	if !leaseUntil.Equal(originalLease) {
+		t.Fatalf("lease_until foi alterado: original=%v atual=%v", originalLease, leaseUntil)
+	}
+
+	// Verificar se o status e attempts continuam iguais.
+	var status string
+	var attempts int
+	if err := pool.QueryRow(ctx, "SELECT status, attempts FROM jobs WHERE id = $1", id).Scan(&status, &attempts); err != nil {
+		t.Fatalf("consultar job: %v", err)
+	}
+
+	if status != "processing" || attempts != 2 {
+		t.Fatalf("job não está na tentativa 2: status=%q attempts=%d", status, attempts)
+	}
+}
