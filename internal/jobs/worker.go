@@ -67,6 +67,64 @@ func processRepositoryJob(
 
 	log.Printf("Worker %d iniciou job %d (tarefa %d)", workerID, job.ID, label)
 
+	jobCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
+
+	// cria um novo contexto para o heartbeat
+	// que é cancelado quando o job é cancelado
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(jobCtx)
+	defer cancelHeartbeat()
+
+	// cria um canal para o erro do heartbeat
+	// que é usado para enviar o erro do heartbeat
+	heartbeatErr := make(chan error, 1)
+	heartbeatDone := make(chan struct{})
+
+	// heartbeat goroutine
+	// manda o heartbeat para o job a cada 10 segundos
+	// se o job for cancelado, para a goroutine
+	// se a goroutine for cancelada, para o heartbeat
+	go func() {
+		defer close(heartbeatDone)
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+
+			//chamar o repo.RenewLease
+			//Se RenewLease() retornar nil, registre que o lease foi renovado.
+			//Se retornar um erro, registre o erro e encerre a goroutine com return.
+			//Mantenha defer close(heartbeatDone) e defer ticker.Stop().
+			case <-ticker.C:
+				if err := repo.RenewLease(heartbeatCtx, job.ID, job.Attempts); err !=
+					nil {
+					log.Printf(
+						"Worker %d erro ao renovar lease do job %d: %v",
+						workerID,
+						job.ID,
+						err,
+					)
+					//enviar o erro pelo canal heartbeatErr
+					//chamar cancelJob para interromper a goroutine
+					heartbeatErr <- err
+					cancelJob()
+
+					return
+				}
+				log.Printf(
+					"Worker %d renovou lease do job %d",
+					workerID,
+					job.ID,
+				)
+
+			}
+		}
+	}()
+
 	select {
 	case <-time.After(defaultWorkDuration):
 		if err := repo.Complete(ctx, job.ID, job.Attempts); err != nil {
@@ -75,12 +133,22 @@ func processRepositoryJob(
 		}
 		log.Printf("Worker %d concluiu job %d (tarefa %d)", workerID, job.ID, label)
 
-	case <-ctx.Done():
-		// Contexto novo: o ctx do worker já foi cancelado e não serviria para o UPDATE.
+	case <-jobCtx.Done():
+		// Contexto novo: jobCtx pode ter sido cancelado pelo worker ou pelo heartbeat,
+		// e nesse caso o contexto original não serve para o UPDATE.
 		failCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if err := repo.Fail(failCtx, job.ID, ctx.Err().Error(), job.Attempts); err != nil {
+		select {
+		case err := <-heartbeatErr:
+			//Registar o erro e encerrar o processamento
+			log.Printf("Worker %d erro do heartbeat: %v", workerID, err)
+			return
+		default:
+			//Não existe erro pendente no canal.
+		}
+
+		if err := repo.Fail(failCtx, job.ID, jobCtx.Err().Error(), job.Attempts); err != nil {
 			log.Printf("Worker %d erro ao marcar falha do job %d: %v", workerID, job.ID, err)
 		}
 		log.Printf("Worker %d interrompeu job %d", workerID, job.ID)
